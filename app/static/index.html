@@ -1,0 +1,352 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>微批显存演练 · 线性分类器</title>
+<style>
+  :root {
+    --bg: #0f172a; --panel: #16213a; --panel-2: #1d2b47; --line: #2c3c5e;
+    --text: #e6edf7; --muted: #93a4c3; --accent: #4f8cff; --ok: #35c46b;
+    --warn: #f2b23c; --bad: #ef5b5b; --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.6 system-ui, -apple-system, "Segoe UI", "Noto Sans SC", sans-serif; }
+  header { padding: 22px 28px 10px; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  header p { color: var(--muted); margin: 0; }
+  main { padding: 12px 28px 48px; display: grid; gap: 16px; }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 16px 18px; }
+  .panel h2 { font-size: 15px; margin: 0 0 12px; font-weight: 600; }
+  .layout { display: grid; grid-template-columns: 340px minmax(0, 1fr); gap: 16px; align-items: start; }
+  @media (max-width: 980px) { .layout { grid-template-columns: 1fr; } }
+  form .row { display: grid; grid-template-columns: 1fr 92px; gap: 8px; align-items: center; margin-bottom: 8px; }
+  form label { color: var(--muted); }
+  input[type=number] { width: 100%; background: var(--panel-2); color: var(--text);
+    border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; font: inherit; }
+  input:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+  fieldset { border: 1px solid var(--line); border-radius: 8px; margin: 12px 0 4px; padding: 10px 12px 12px; }
+  legend { color: var(--muted); padding: 0 6px; font-size: 13px; }
+  .hint { color: var(--muted); font-size: 12px; margin: 4px 0 0; }
+  button { background: var(--accent); color: #fff; border: 0; border-radius: 7px;
+    padding: 9px 16px; font: 600 14px inherit; cursor: pointer; width: 100%; margin-top: 12px; }
+  button:disabled { opacity: .55; cursor: progress; }
+  .row-between { display: flex; gap: 12px; align-items: baseline; justify-content: space-between; flex-wrap: wrap; }
+  .status { color: var(--muted); font-size: 13px; }
+  .status.error { color: var(--bad); }
+  .badge { display: inline-block; border-radius: 999px; padding: 1px 9px; font-size: 12px; border: 1px solid var(--line); color: var(--muted); }
+  .badge.ok { color: var(--ok); border-color: #25653f; background: #122c1e; }
+  .badge.bad { color: var(--bad); border-color: #6c2a2a; background: #2e1414; }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; }
+  .card { background: var(--panel-2); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; }
+  .card .k { color: var(--muted); font-size: 12px; }
+  .card .v { font: 600 18px var(--mono); margin-top: 2px; }
+  .card .v.small { font-size: 14px; }
+  .verdict { margin-top: 12px; padding: 10px 12px; border-radius: 8px; border: 1px solid var(--line); background: var(--panel-2); }
+  .verdict.ok { border-color: #25653f; }
+  .verdict.bad { border-color: #6c2a2a; }
+  .verdict strong { display: block; margin-bottom: 2px; }
+  .feedback { margin-top: 12px; }
+  .feedback:empty { display: none; }
+  .feedback .item { border-left: 3px solid var(--warn); background: #2a2312; padding: 6px 10px; border-radius: 4px; margin-bottom: 6px; font-size: 13px; }
+  .feedback .item.bad { border-color: var(--bad); background: #2e1414; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; }
+  td.num { font-family: var(--mono); font-size: 12px; }
+  svg { display: block; width: 100%; height: auto; background: var(--panel-2); border-radius: 8px; border: 1px solid var(--line); }
+  .legend { display: flex; gap: 14px; color: var(--muted); font-size: 12px; margin-top: 6px; }
+  .legend i { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 5px; }
+  .empty { color: var(--muted); font-size: 13px; }
+  .samples { font-family: var(--mono); font-size: 12px; color: var(--muted); }
+</style>
+</head>
+<body>
+<header>
+  <h1>微批显存演练 · 线性分类器</h1>
+  <p>CPU · 带动量 SGD · 内置 96 个二维三分类样本 · 反传超限时模拟显存不足并缩小微批重试</p>
+</header>
+<main>
+  <div class="layout">
+    <section class="panel">
+      <h2>训练设置</h2>
+      <form id="form">
+        <div class="row"><label for="samples_per_update">每次更新的样本数 B</label>
+          <input type="number" id="samples_per_update" min="1" max="96" required></div>
+        <div class="row"><label for="initial_micro_batch">初始微批大小</label>
+          <input type="number" id="initial_micro_batch" min="1" max="96" required></div>
+        <div class="row"><label for="update_count">更新次数</label>
+          <input type="number" id="update_count" min="1" max="20" required></div>
+        <div class="row"><label for="lr">学习率</label>
+          <input type="number" id="lr" step="any" min="0.0001" max="10" required></div>
+        <div class="row"><label for="momentum">动量</label>
+          <input type="number" id="momentum" step="any" min="0" max="0.9999" required></div>
+        <div class="row"><label for="seed">随机种子</label>
+          <input type="number" id="seed" min="0" required></div>
+        <fieldset>
+          <legend>显存演练</legend>
+          <div class="row"><label for="oom_start_backward">从第几次反传起收紧</label>
+            <input type="number" id="oom_start_backward" min="0" required></div>
+          <div class="row"><label for="oom_cap">微批样本上限</label>
+            <input type="number" id="oom_cap" min="0" max="96" required></div>
+          <p class="hint">从第 N 次反传起，单个反传最多处理上限个样本；超过即模拟显存不足。上限为 0 时单样本也会失败，训练停在最后一次完整更新（若第 1 次更新即失败则没有任何更新）。起始值填 0 表示关闭演练。</p>
+        </fieldset>
+        <button type="submit" id="run">开始训练</button>
+      </form>
+      <p class="status" id="status"></p>
+    </section>
+
+    <div style="display:grid;gap:16px">
+      <section class="panel">
+        <div class="row-between">
+          <h2 style="margin:0">样本与分类器</h2>
+          <span class="badge" id="datasetBadge"></span>
+        </div>
+        <div id="scatter"></div>
+        <div class="legend" id="legend"></div>
+        <p class="hint">同一批样本、同一顺序只做一次参数与动量更新；缩小微批只改变计算切分，不改变样本集合、顺序或权重。</p>
+      </section>
+
+      <section class="panel">
+        <h2>本次运行摘要</h2>
+        <div class="cards" id="cards"><span class="empty">尚未运行。</span></div>
+        <div class="verdict" id="verdict" hidden></div>
+        <div class="feedback" id="feedback"></div>
+      </section>
+
+      <section class="panel">
+        <h2>逐次对照整批训练（同初值 · 同样本顺序）</h2>
+        <div id="updates"><span class="empty">运行后显示每次更新的参数与动量最大绝对差。</span></div>
+      </section>
+    </div>
+  </div>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const FIELDS = ["samples_per_update", "initial_micro_batch", "update_count", "lr",
+  "momentum", "seed", "oom_start_backward", "oom_cap"];
+const API_FIELDS = { update_count: "updates" };
+const COLORS = ["#4f8cff", "#35c46b", "#f2b23c"];
+const CLASS_NAMES = ["类别 0", "类别 1", "类别 2"];
+
+function fmt(x, digits = 3) {
+  if (x === null || x === undefined) return "—";
+  if (x === 0) return "0";
+  if (Math.abs(x) < 1e-3 || Math.abs(x) >= 1e4) return x.toExponential(digits - 1);
+  return Number(x).toFixed(digits);
+}
+
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+function readForm() {
+  const payload = {};
+  for (const key of FIELDS) {
+    const raw = $(key).value.trim();
+    if (raw === "") throw new Error("请填写所有设置项");
+    const value = Number(raw);
+    if (!Number.isFinite(value)) throw new Error("设置项必须是数字");
+    payload[API_FIELDS[key] || key] =
+      key === "lr" || key === "momentum" ? value : Math.trunc(value);
+  }
+  return payload;
+}
+
+function setStatus(text, isError = false) {
+  const el = $("status");
+  el.textContent = text;
+  el.className = "status" + (isError ? " error" : "");
+}
+
+async function loadDataset() {
+  const res = await fetch("/api/dataset");
+  if (!res.ok) throw new Error("无法载入内置数据集");
+  const ds = await res.json();
+  for (const key of FIELDS) {
+    const apiKey = API_FIELDS[key] || key;
+    if (ds.defaults[apiKey] !== undefined) $(key).value = ds.defaults[apiKey];
+  }
+
+  const dots = ds.points.map((p) =>
+    `<circle cx="${p.cx}" cy="${p.cy}" r="4" fill="${COLORS[p.label]}" opacity="0.9">
+       <title>样本 #${p.id} · ${CLASS_NAMES[p.label]}</title></circle>`).join("");
+  $("scatter").innerHTML =
+    `<svg viewBox="0 0 520 280" role="img" aria-label="内置二维样本散点图">${dots}</svg>`;
+  $("legend").innerHTML = ds.class_names.map((name, i) =>
+    `<span><i style="background:${COLORS[i]}"></i>${name}（${ds.class_counts[i]}）</span>`).join("");
+  $("datasetBadge").textContent = `${ds.n_samples} 个样本 · ${ds.features} 维 · ${ds.classes} 类`;
+}
+
+function summaryCards(r) {
+  const c = r.config;
+  const status = r.stopped
+    ? `<span class="badge bad">已停止</span>`
+    : `<span class="badge ok">完成</span>`;
+  const drill = c.drill_active
+    ? `第 ${c.oom_start_backward} 次起 · 上限 ${c.oom_cap}`
+    : "关闭";
+  const cards = [
+    ["状态", status, true],
+    ["完成更新 / 计划", `${r.completed_updates} / ${r.total_updates}`, false],
+    ["反传次数", String(r.backward_attempts), false],
+    ["缩批次数", String(r.shrink_count), false],
+    ["参数最大绝对差", fmt(r.max_param_diff), false],
+    ["动量最大绝对差", fmt(r.max_momentum_diff), false],
+    ["每次更新样本数", String(c.samples_per_update), false],
+    ["初始微批", String(c.initial_micro_batch), false],
+    ["演练", drill, true],
+  ];
+  return cards.map(([k, v, raw]) =>
+    `<div class="card"><div class="k">${k}</div><div class="v${raw ? " small" : ""}">${v}</div></div>`).join("");
+}
+
+function verdict(r) {
+  const el = $("verdict");
+  const tol = 1e-6;
+  const same = r.max_param_diff <= tol && r.max_momentum_diff <= tol;
+  el.hidden = false;
+  if (r.stopped) {
+    el.className = "verdict bad";
+    el.innerHTML = `<strong>演练中止</strong>${esc(r.stopped.message)}
+      （第 ${r.stopped.update} 次更新、第 ${r.stopped.backward} 次反传；已完成 ${r.stopped.completed_updates} 次更新）`;
+    return;
+  }
+  el.className = "verdict " + (same && r.completed_updates === r.total_updates ? "ok" : "bad");
+  el.innerHTML = same
+    ? `<strong>与整批参考一致</strong>全部 ${r.completed_updates} 次更新的参数与动量差异均在 1e-6 以内（浮点累积误差量级）。`
+    : `<strong>与整批参考存在偏差</strong>参数或动量最大绝对差超过 1e-6，请检查微批切分与梯度缩放。`;
+}
+
+function feedback(r) {
+  const items = [];
+  const scan = (updateNo, attempts) => {
+    for (const a of attempts) {
+      if (a.status === "oom") {
+        items.push(`<div class="item">第 ${updateNo} 次更新：第 ${a.backward} 次反传（${a.size} 个样本）超过上限 ${a.cap}，` +
+          `已写入 ${a.written} 个样本的梯度后模拟显存不足；回滚梯度，缩到 ${a.next_size} 个样本重试。</div>`);
+      } else if (a.status === "single_sample_failed") {
+        const tail = r.stopped && r.stopped.completed_updates > 0
+          ? "训练停在最后一次完整更新。"
+          : "训练中止，没有任何完整更新。";
+        items.push(`<div class="item bad">第 ${updateNo} 次更新：第 ${a.backward} 次反传单样本仍超过上限 ${a.cap}，` +
+          `${tail}</div>`);
+      }
+    }
+  };
+  for (const u of r.updates) scan(u.update, u.attempts);
+  if (r.stopped && r.stopped.attempts) scan(r.stopped.update, r.stopped.attempts);
+  $("feedback").innerHTML = items.join("");
+}
+
+function attemptsCell(attempts) {
+  const parts = attempts.map((a) => {
+    if (a.status === "ok") return `<span class="badge ok">#${a.backward} ${a.size} ✓</span>`;
+    if (a.status === "oom") return `<span class="badge bad">#${a.backward} ${a.size} OOM→${a.next_size}</span>`;
+    return `<span class="badge bad">#${a.backward} 1 ✗</span>`;
+  });
+  return parts.join(" ");
+}
+
+function updatesTable(r) {
+  const el = $("updates");
+  if (!r.updates.length && !r.stopped) {
+    el.innerHTML = `<span class="empty">没有完成的更新。</span>`;
+    return;
+  }
+  const rows = r.updates.map((u) => `
+    <tr>
+      <td class="num">${u.update}</td>
+      <td class="num">${u.sample_ids.length}</td>
+      <td><div class="samples">${u.sample_ids.join(", ")}</div></td>
+      <td>${attemptsCell(u.attempts)}</td>
+      <td class="num">${u.optimizer_steps}</td>
+      <td class="num">${fmt(u.param_max_abs_diff)}</td>
+      <td class="num">${fmt(u.momentum_max_abs_diff)}</td>
+    </tr>`).join("");
+  let stoppedRow = "";
+  if (r.stopped) {
+    const ids = (r.stopped.sample_ids || []).join(", ") || "—";
+    stoppedRow = `
+    <tr>
+      <td class="num">${r.stopped.update}</td>
+      <td class="num">${(r.stopped.sample_ids || []).length || "—"}</td>
+      <td class="samples">${ids}<br>中止，未完成</td>
+      <td>${attemptsCell(r.stopped.attempts || [])}</td>
+      <td class="num">0</td>
+      <td class="num">—</td>
+      <td class="num">—</td>
+    </tr>`;
+  }
+  el.innerHTML = `
+    <div style="overflow-x:auto"><table>
+      <thead><tr>
+        <th>更新</th><th>样本数</th><th>样本 ID（原顺序）</th>
+        <th>反传序列</th><th>参数更新次数</th>
+        <th>参数最大绝对差</th><th>动量最大绝对差</th>
+      </tr></thead>
+      <tbody>${rows}${stoppedRow}</tbody>
+    </table></div>`;
+}
+
+function render(r) {
+  $("cards").innerHTML = summaryCards(r);
+  verdict(r);
+  feedback(r);
+  updatesTable(r);
+}
+
+async function submit(event) {
+  event.preventDefault();
+  const button = $("run");
+  const form = $("form");
+  if (!form.checkValidity()) {
+    const bad = [...form.elements].find((el) => el.willValidate && !el.checkValidity());
+    setStatus(bad ? `请检查「${bad.labels[0].textContent.trim()}」：取值超出允许范围。`
+                  : "请检查输入项的取值范围。", true);
+    form.reportValidity();
+    return;
+  }
+  let payload;
+  try {
+    payload = readForm();
+  } catch (err) {
+    setStatus(err.message, true);
+    return;
+  }
+  if (payload.initial_micro_batch > payload.samples_per_update) {
+    setStatus("初始微批大小不能超过每次更新的样本数。", true);
+    return;
+  }
+  button.disabled = true;
+  setStatus("训练中…");
+  try {
+    const res = await fetch("/api/train", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      const detail = typeof body.detail === "string"
+        ? body.detail
+        : (body.detail && body.detail[0] && body.detail[0].msg) || "训练请求失败";
+      throw new Error(detail);
+    }
+    render(body);
+    setStatus(body.stopped ? "演练中止，见下方说明。" : "训练完成。");
+  } catch (err) {
+    setStatus(err.message || "请求失败", true);
+  } finally {
+    button.disabled = false;
+  }
+}
+
+$("form").addEventListener("submit", submit);
+loadDataset().catch((err) => setStatus(err.message, true));
+</script>
+</body>
+</html>

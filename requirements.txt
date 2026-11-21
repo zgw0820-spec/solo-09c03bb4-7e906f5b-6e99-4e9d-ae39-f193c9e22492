@@ -1,0 +1,8 @@
+# CPU-only PyTorch: the demo never needs CUDA.  The +cpu local version tag is
+# preferred by pip over the plain PyPI build of the same version.
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+torch==2.15.0
+fastapi==0.165.0
+uvicorn[standard]==0.54.0
+pydantic==2.14.4
