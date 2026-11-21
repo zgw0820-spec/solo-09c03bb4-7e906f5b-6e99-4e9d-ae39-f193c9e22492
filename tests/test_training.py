@@ -11,6 +11,72 @@ from app.main import app
 TOL = 1e-6
 
 
+def _independent_paths(config):
+    """Reference implementation: drill and reference run fully separately.
+
+    Mirrors the pre-fusion semantics: the drill does one SGD step per update
+    after all its micro-batches, and the separate full-batch reference is
+    advanced only for updates the drill actually completed.
+    """
+    order = data.build_sample_order(config.seed)
+    model = training.initial_model(config.seed)
+    optimizer = training._make_optimizer(model, config)
+    drill = []
+    backward_number = 0
+    for update_index in range(config.updates):
+        indices = data.batch_indices(
+            order, update_index, config.samples_per_update
+        )
+        optimizer.zero_grad(set_to_none=True)
+        size = config.initial_micro_batch
+        position = 0
+        aborted = False
+        while position < len(indices):
+            chunk_size = min(size, len(indices) - position)
+            chunk = indices[position : position + chunk_size]
+            cap = (
+                config.oom_cap
+                if config.oom_start_backward > 0
+                and backward_number + 1 >= config.oom_start_backward
+                else None
+            )
+            backward_number += 1
+            before = training._grad_snapshot(model)
+            try:
+                training._run_micro_backward(
+                    model, chunk, config.samples_per_update, cap
+                )
+            except training.SimulatedOOM:
+                training._restore_grads(model, before)
+                if chunk_size == 1:
+                    aborted = True
+                    break
+                size = max(1, min(config.oom_cap, (chunk_size + 1) // 2))
+                continue
+            position += chunk_size
+        if aborted:
+            break
+        optimizer.step()
+        drill.append(training._snapshot(model, optimizer))
+
+    ref_model = training.initial_model(config.seed)
+    ref_optimizer = training._make_optimizer(ref_model, config)
+    reference = []
+    for update_index in range(len(drill)):
+        indices = data.batch_indices(
+            order, update_index, config.samples_per_update
+        )
+        ref_optimizer.zero_grad(set_to_none=True)
+        training._full_batch_loss(ref_model, indices).backward()
+        ref_optimizer.step()
+        reference.append(training._snapshot(ref_model, ref_optimizer))
+    return drill, reference
+
+
+def _diff(a, b, key):
+    return float((training._flat(a[key]) - training._flat(b[key])).abs().max().item())
+
+
 def test_dataset_shape_and_balance():
     assert data.X.shape == (data.N_SAMPLES, data.FEATURES)
     assert data.Y.shape == (data.N_SAMPLES,)
@@ -208,6 +274,112 @@ def test_drill_off_matches_plain_full_batch():
     )
     result = training.run(config)
     assert result["shrink_count"] == 0
+    assert result["max_param_diff"] <= TOL
+    assert result["max_momentum_diff"] <= TOL
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        # A split from the very first update, before the drill is active.
+        training.TrainConfig(
+            samples_per_update=8, initial_micro_batch=3,
+            oom_start_backward=0, updates=5,
+        ),
+        # The drill first bites on update 3: updates 1-2 are shared.
+        training.TrainConfig(
+            samples_per_update=8, initial_micro_batch=8,
+            oom_start_backward=3, oom_cap=2, updates=6,
+        ),
+        # Divergence in the middle of an update, after a successful chunk.
+        training.TrainConfig(
+            samples_per_update=8, initial_micro_batch=4,
+            oom_start_backward=2, oom_cap=2, updates=2,
+        ),
+        # Abort while the drill has already diverged.
+        training.TrainConfig(
+            samples_per_update=8, initial_micro_batch=4,
+            oom_start_backward=5, oom_cap=0, updates=5,
+        ),
+        # No split and no retry: every update is shared.
+        training.TrainConfig(
+            samples_per_update=8, initial_micro_batch=8,
+            oom_start_backward=0, updates=4,
+        ),
+    ],
+)
+def test_fused_steps_match_independent_paths(config):
+    """The shared-prefix fusion must not change either path's trajectory.
+
+    Every per-update parameter and momentum difference has to equal the one
+    produced when both paths run completely independently from step one.
+    """
+    result = training.run(config)
+    drill, reference = _independent_paths(config)
+    assert result["completed_updates"] == len(drill) == len(reference)
+    for row, drill_snapshot, ref_snapshot in zip(
+        result["updates"], drill, reference
+    ):
+        assert row["param_max_abs_diff"] == _diff(
+            drill_snapshot, ref_snapshot, "params"
+        )
+        assert row["momentum_max_abs_diff"] == _diff(
+            drill_snapshot, ref_snapshot, "momentum"
+        )
+
+
+def test_shared_prefix_uses_one_backward_and_one_step_per_update():
+    """Before any split/retry each update costs one backward + one SGD."""
+    config = training.TrainConfig(
+        samples_per_update=8, initial_micro_batch=8,
+        oom_start_backward=3, oom_cap=2, updates=6,
+    )
+    result = training.run(config)
+    assert result["divergence_update"] == 3
+    assert result["shared_backwards"] == 2
+    # Updates 1-2 shared; updates 3-6 are the reference's own backwars.
+    assert result["reference_backwards"] == 4
+    assert result["backward_attempts"] == 2 + 4 * 5  # 4 OOM + 4x4 ok chunks
+    for row in result["updates"][:2]:
+        assert row["attempts"] == [
+            {
+                "backward": row["update"],
+                "size": 8,
+                "status": "ok",
+                "grad_norm": row["attempts"][0]["grad_norm"],
+                "cap": None,
+            }
+        ]
+        assert row["optimizer_steps"] == 1
+        assert row["reference_backwards"] == 0
+
+
+def test_reference_stops_at_last_completed_update():
+    """The reference performs no backward for an update the drill aborts."""
+    config = training.TrainConfig(
+        samples_per_update=8, initial_micro_batch=8,
+        oom_start_backward=3, oom_cap=0, updates=6,
+    )
+    result = training.run(config)
+    assert result["completed_updates"] == 2
+    # No completed update was ever split, so the paths never diverged and the
+    # reference never needed a backward of its own.
+    assert result["divergence_update"] is None
+    assert result["shared_backwards"] == 2
+    assert result["reference_backwards"] == 0
+    assert all(row["reference_backwards"] == 0 for row in result["updates"])
+
+
+def test_first_step_split_reports_divergence_on_update_one():
+    config = training.TrainConfig(
+        samples_per_update=8, initial_micro_batch=4,
+        oom_start_backward=0, updates=3,
+    )
+    result = training.run(config)
+    assert result["divergence_update"] == 1
+    assert result["shared_backwards"] == 0
+    assert result["reference_backwards"] == 3
+    assert [row["reference_backwards"] for row in result["updates"]] == [1, 1, 1]
     assert result["max_param_diff"] <= TOL
     assert result["max_momentum_diff"] <= TOL
 

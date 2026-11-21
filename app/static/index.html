@@ -105,7 +105,7 @@
         </div>
         <div id="scatter"></div>
         <div class="legend" id="legend"></div>
-        <p class="hint">同一批样本、同一顺序只做一次参数与动量更新；缩小微批只改变计算切分，不改变样本集合、顺序或权重。</p>
+        <p class="hint">同一批样本、同一顺序只做一次参数与动量更新；缩小微批只改变计算切分，不改变样本集合、顺序或权重。演练与整批参考在拆分或重试前的更新上共用同一次反传与 SGD，分叉后各自推进。</p>
       </section>
 
       <section class="panel">
@@ -192,13 +192,16 @@ function summaryCards(r) {
   const cards = [
     ["状态", status, true],
     ["完成更新 / 计划", `${r.completed_updates} / ${r.total_updates}`, false],
-    ["反传次数", String(r.backward_attempts), false],
+    ["演练反传次数", String(r.backward_attempts), false],
+    ["参考额外反传", String(r.reference_backwards), false],
+    ["共用反传 / 更新", String(r.shared_backwards), false],
     ["缩批次数", String(r.shrink_count), false],
     ["参数最大绝对差", fmt(r.max_param_diff), false],
     ["动量最大绝对差", fmt(r.max_momentum_diff), false],
     ["每次更新样本数", String(c.samples_per_update), false],
     ["初始微批", String(c.initial_micro_batch), false],
     ["演练", drill, true],
+    ["分叉更新", r.divergence_update ? `第 ${r.divergence_update} 次` : "未分叉", true],
   ];
   return cards.map(([k, v, raw]) =>
     `<div class="card"><div class="k">${k}</div><div class="v${raw ? " small" : ""}">${v}</div></div>`).join("");
@@ -216,9 +219,13 @@ function verdict(r) {
     return;
   }
   el.className = "verdict " + (same && r.completed_updates === r.total_updates ? "ok" : "bad");
-  el.innerHTML = same
-    ? `<strong>与整批参考一致</strong>全部 ${r.completed_updates} 次更新的参数与动量差异均在 1e-6 以内（浮点累积误差量级）。`
-    : `<strong>与整批参考存在偏差</strong>参数或动量最大绝对差超过 1e-6，请检查微批切分与梯度缩放。`;
+  const shared = r.divergence_update
+    ? `前 ${r.divergence_update - 1} 次更新两路共用一次反传 + 一次 SGD；从第 ${r.divergence_update} 次起各自推进参数与动量。`
+    : `全部更新两路共用一次反传 + 一次 SGD。`;
+  el.innerHTML = (same
+    ? `<strong>与整批参考一致</strong>已完成的 ${r.completed_updates} 次更新，参数与动量差异均在 1e-6 以内（浮点累积误差量级）。`
+    : `<strong>与整批参考存在偏差</strong>参数或动量最大绝对差超过 1e-6，请检查微批切分与梯度缩放。`)
+    + `<br>${shared}整批参考额外执行了 ${r.reference_backwards} 次反传（只算到演练最后一次完成的更新）。`;
 }
 
 function feedback(r) {
@@ -258,12 +265,13 @@ function updatesTable(r) {
     return;
   }
   const rows = r.updates.map((u) => `
-    <tr>
-      <td class="num">${u.update}</td>
+    <tr${u.update === r.divergence_update ? ' style="background:#1b2743"' : ""}>
+      <td class="num">${u.update}${u.update === r.divergence_update ? " ⟂" : ""}</td>
       <td class="num">${u.sample_ids.length}</td>
       <td><div class="samples">${u.sample_ids.join(", ")}</div></td>
       <td>${attemptsCell(u.attempts)}</td>
       <td class="num">${u.optimizer_steps}</td>
+      <td class="num">${u.reference_backwards}</td>
       <td class="num">${fmt(u.param_max_abs_diff)}</td>
       <td class="num">${fmt(u.momentum_max_abs_diff)}</td>
     </tr>`).join("");
@@ -277,6 +285,7 @@ function updatesTable(r) {
       <td class="samples">${ids}<br>中止，未完成</td>
       <td>${attemptsCell(r.stopped.attempts || [])}</td>
       <td class="num">0</td>
+      <td class="num">0</td>
       <td class="num">—</td>
       <td class="num">—</td>
     </tr>`;
@@ -285,7 +294,7 @@ function updatesTable(r) {
     <div style="overflow-x:auto"><table>
       <thead><tr>
         <th>更新</th><th>样本数</th><th>样本 ID（原顺序）</th>
-        <th>反传序列</th><th>参数更新次数</th>
+        <th>反传序列</th><th>演练 SGD 更新</th><th>参考额外反传</th>
         <th>参数最大绝对差</th><th>动量最大绝对差</th>
       </tr></thead>
       <tbody>${rows}${stoppedRow}</tbody>

@@ -12,6 +12,15 @@ partial backward for the first ``cap`` samples and then raises
 engine, which halves the micro-batch (never going above ``cap``) and retries.
 A single sample that still exceeds the cap aborts the run at the last
 completed update.
+
+The drill and the reference are fused while they are provably identical: as
+long as every update is completed by a single full-batch backward, one
+backward + one SGD step is run once and both paths share the resulting state.
+The first split or retry marks the divergence update; the reference is cloned
+from the pre-update state only then, and each path advances its own parameters
+and momentum from that step onward.  The reference is never advanced for an
+update the drill did not complete, so it stops at the drill's last completed
+update and its extra backward passes are exactly the post-divergence ones.
 """
 
 from __future__ import annotations
@@ -140,20 +149,30 @@ def _full_batch_loss(model: nn.Linear, indices: list[int]) -> torch.Tensor:
     return F.cross_entropy(logits, data.Y[indices])
 
 
-def reference_training(
-    config: TrainConfig, order: list[int]
-) -> list[dict[str, Any]]:
-    """Plain full-batch training: one backward and one step per update."""
-    model = initial_model(config.seed)
-    optimizer = _make_optimizer(model, config)
-    snapshots = []
-    for update_index in range(config.updates):
-        indices = data.batch_indices(order, update_index, config.samples_per_update)
-        optimizer.zero_grad(set_to_none=True)
-        _full_batch_loss(model, indices).backward()
-        optimizer.step()
-        snapshots.append(_snapshot(model, optimizer))
-    return snapshots
+def _clone_training_state(
+    model: nn.Linear, optimizer: torch.optim.SGD, config: TrainConfig
+) -> tuple[nn.Linear, torch.optim.SGD]:
+    """Deep-copy parameters, momentum and gradients so one path can advance alone.
+
+    Gradients are part of the state on purpose: if the paths diverge in the
+    middle of an update, the drill keeps the partial gradients already written
+    by its successful chunks, exactly like an independent drill run would.
+    """
+    clone = nn.Linear(data.FEATURES, data.CLASSES)
+    with torch.no_grad():
+        for source, target in zip(model.parameters(), clone.parameters()):
+            target.copy_(source)
+            if source.grad is not None:
+                target.grad = source.grad.detach().clone()
+    clone_optimizer = _make_optimizer(clone, config)
+    for source, target in zip(model.parameters(), clone.parameters()):
+        state = optimizer.state.get(source)
+        if state:
+            clone_optimizer.state[target] = {
+                key: value.detach().clone() if torch.is_tensor(value) else value
+                for key, value in state.items()
+            }
+    return clone, clone_optimizer
 
 
 def _run_micro_backward(
@@ -186,20 +205,75 @@ def _run_micro_backward(
 def micro_batch_training(
     config: TrainConfig, order: list[int]
 ) -> dict[str, Any]:
-    """Drill training with shrink-and-retry, one optimizer step per update."""
-    model = initial_model(config.seed)
-    optimizer = _make_optimizer(model, config)
+    """Drill training with shrink-and-retry and a lazily-forked reference.
+
+    Fused phase (before any split or retry): an update completed by exactly one
+    full-batch backward is executed once, and the resulting parameters and
+    momentum serve both the drill and the reference, so each such step costs
+    one backward and one SGD update in total.
+
+    The first update that splits the batch (``initial_micro_batch < B``) or
+    retries after an OOM marks the divergence update.  Both paths are forked
+    from that update's pre-update state (parameters and momentum) and advance
+    independently from then on: the drill uses its micro-batches, the reference
+    one full-batch backward + one SGD step.  The reference is only advanced for
+    updates the drill completes, so it ends at the drill's last completed
+    update and never runs ahead of it.  ``reference_backwards`` therefore
+    counts exactly the backward passes the reference performed in addition to
+    the shared ones.
+    """
+    shared_model = initial_model(config.seed)
+    shared_optimizer = _make_optimizer(shared_model, config)
+
+    drill_model, drill_optimizer = shared_model, shared_optimizer
+    reference_model, reference_optimizer = shared_model, shared_optimizer
+    diverged = False
+
     drill_active = config.oom_start_backward > 0
     backward_number = 0
     shrink_count = 0
+    shared_backwards = 0
+    reference_backwards = 0
+    divergence_update: int | None = None
     updates: list[dict[str, Any]] = []
     stopped: dict[str, Any] | None = None
+
+    def fork_paths() -> tuple[nn.Linear, torch.optim.SGD]:
+        """Give the drill and the reference independent state from now on.
+
+        Called before the divergence update runs anything (a deliberate split)
+        or right after an OOM rolled back its partial gradient writes.  The
+        shared parameters/momentum are the pre-update state both paths start
+        from; each gets a private copy so later steps cannot alias.
+        """
+        nonlocal reference_model, reference_optimizer
+        owned_model, owned_optimizer = _clone_training_state(
+            shared_model, shared_optimizer, config
+        )
+        reference_model, reference_optimizer = _clone_training_state(
+            shared_model, shared_optimizer, config
+        )
+        # The drill keeps gradients of chunks that already succeeded; the
+        # reference always starts its update from a clean gradient.
+        reference_optimizer.zero_grad(set_to_none=True)
+        return owned_model, owned_optimizer
 
     for update_index in range(config.updates):
         indices = data.batch_indices(
             order, update_index, config.samples_per_update
         )
-        optimizer.zero_grad(set_to_none=True)
+        # A new update starts from a clean gradient on both paths.  Zero the
+        # shared optimizer first so a fork taken here clones clean gradients.
+        drill_optimizer.zero_grad(set_to_none=True)
+        if diverged:
+            reference_optimizer.zero_grad(set_to_none=True)
+        will_split = config.initial_micro_batch < len(indices)
+        divergence_here = False
+        if not diverged and will_split:
+            diverged = True
+            divergence_here = True
+            drill_model, drill_optimizer = fork_paths()
+
         size = config.initial_micro_batch
         position = 0
         attempts: list[dict[str, Any]] = []
@@ -213,13 +287,13 @@ def micro_batch_training(
             )
             cap = config.oom_cap if cap_applies else None
             backward_number += 1
-            before = _grad_snapshot(model)
+            before = _grad_snapshot(drill_model)
             try:
                 grad_norm = _run_micro_backward(
-                    model, chunk, config.samples_per_update, cap
+                    drill_model, chunk, config.samples_per_update, cap
                 )
             except SimulatedOOM as oom:
-                _restore_grads(model, before)
+                _restore_grads(drill_model, before)
                 record = {
                     "backward": backward_number,
                     "size": chunk_size,
@@ -227,6 +301,12 @@ def micro_batch_training(
                     "partial_grad_norm": oom.partial_grad_norm,
                     "cap": config.oom_cap,
                 }
+                if not diverged and chunk_size > 1:
+                    # A retry is the first split: fork from the pre-update
+                    # state, discarding the partial gradient writes.
+                    diverged = True
+                    divergence_here = True
+                    drill_model, drill_optimizer = fork_paths()
                 if chunk_size == 1:
                     attempts.append(
                         {**record, "status": "single_sample_failed"}
@@ -280,34 +360,48 @@ def micro_batch_training(
         if aborted:
             break
 
-        optimizer.step()
+        drill_optimizer.step()
+        if divergence_here:
+            divergence_update = update_index + 1
+        if diverged:
+            reference_optimizer.zero_grad(set_to_none=True)
+            _full_batch_loss(reference_model, indices).backward()
+            reference_optimizer.step()
+            reference_backwards += 1
+        else:
+            shared_backwards += 1
+            reference_model, reference_optimizer = drill_model, drill_optimizer
+
         updates.append(
             {
                 "update": update_index + 1,
                 "sample_ids": indices,
                 "attempts": attempts,
                 "optimizer_steps": 1,
-                "snapshot": _snapshot(model, optimizer),
+                "reference_backwards": 0 if not diverged else 1,
+                "drill_snapshot": _snapshot(drill_model, drill_optimizer),
+                "reference_snapshot": _snapshot(
+                    reference_model, reference_optimizer
+                ),
             }
         )
 
-    reference = reference_training(config, order)
-
     rows = []
     for record in updates:
-        index = record["update"] - 1
-        ref = reference[index]
         rows.append(
             {
                 "update": record["update"],
                 "sample_ids": record["sample_ids"],
                 "attempts": record["attempts"],
                 "optimizer_steps": record["optimizer_steps"],
+                "reference_backwards": record["reference_backwards"],
                 "param_max_abs_diff": _max_abs_diff(
-                    record["snapshot"], ref, "params"
+                    record["drill_snapshot"], record["reference_snapshot"], "params"
                 ),
                 "momentum_max_abs_diff": _max_abs_diff(
-                    record["snapshot"], ref, "momentum"
+                    record["drill_snapshot"],
+                    record["reference_snapshot"],
+                    "momentum",
                 ),
             }
         )
@@ -317,6 +411,9 @@ def micro_batch_training(
         "total_updates": config.updates,
         "backward_attempts": backward_number,
         "shrink_count": shrink_count,
+        "shared_backwards": shared_backwards,
+        "reference_backwards": reference_backwards,
+        "divergence_update": divergence_update,
         "stopped": stopped,
         "updates": rows,
         "max_param_diff": max(
